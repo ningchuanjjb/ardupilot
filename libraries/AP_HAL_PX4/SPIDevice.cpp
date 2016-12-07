@@ -23,6 +23,27 @@
 #include "Scheduler.h"
 #include "Semaphores.h"
 
+/*
+  NuttX on STM32 doesn't produce the exact SPI bus frequency
+  requested. This is a table mapping requested to achieved SPI
+  frequency:
+
+  2  -> 1.3 MHz
+  4  -> 2.6 MHz
+  6  -> 5.3 MHz
+  8  -> 5.3 MHz
+  10 -> 5.3 MHz
+  11 -> 10
+  12 -> 10
+  13 -> 10
+  14 -> 10
+  16 -> 10
+  18 -> 10
+  20 -> 10
+  21 -> 20
+  28 -> 20
+ */
+
 namespace PX4 {
 
 #define MHZ (1000U*1000U)
@@ -64,16 +85,19 @@ SPIDesc SPIDeviceManager::device_table[] = {
 
 #ifdef PX4_SPI_BUS_EXT
 #ifdef PX4_SPIDEV_EXT0
-    SPIDesc("external0",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT0, SPIDEV_MODE3, 5*MHZ, 5*MHZ),
+    SPIDesc("external0m0",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT0, SPIDEV_MODE0, 2*MHZ, 2*MHZ),
+    SPIDesc("external0m1",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT0, SPIDEV_MODE1, 2*MHZ, 2*MHZ),
+    SPIDesc("external0m2",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT0, SPIDEV_MODE2, 2*MHZ, 2*MHZ),
+    SPIDesc("external0m3",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT0, SPIDEV_MODE3, 2*MHZ, 2*MHZ),
 #endif
 #ifdef PX4_SPIDEV_EXT1
-    SPIDesc("external1",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT1, SPIDEV_MODE3, 5*MHZ, 5*MHZ),
+    SPIDesc("external1",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT1, SPIDEV_MODE3, 2*MHZ, 2*MHZ),
 #endif
 #ifdef PX4_SPIDEV_EXT2
-    SPIDesc("external2",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT2, SPIDEV_MODE3, 5*MHZ, 5*MHZ),
+    SPIDesc("external2",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT2, SPIDEV_MODE3, 2*MHZ, 2*MHZ),
 #endif
 #ifdef PX4_SPIDEV_EXT3
-    SPIDesc("external3",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT3, SPIDEV_MODE3, 5*MHZ, 5*MHZ),
+    SPIDesc("external3",    PX4_SPI_BUS_EXT, (spi_dev_e)PX4_SPIDEV_EXT3, SPIDEV_MODE3, 2*MHZ, 2*MHZ),
 #endif
 #endif
 
@@ -122,7 +146,7 @@ bool SPIDevice::set_speed(AP_HAL::Device::Speed speed)
 /*
   low level transfer function
  */
-void SPIDevice::do_transfer(uint8_t *send, uint8_t *recv, uint32_t len)
+void SPIDevice::do_transfer(const uint8_t *send, uint8_t *recv, uint32_t len)
 {
     /*
       to accomodate the method in PX4 drivers of using interrupt
@@ -150,7 +174,9 @@ void SPIDevice::do_transfer(uint8_t *send, uint8_t *recv, uint32_t len)
     SPI_SETBITS(bus.dev, 8);
     SPI_SELECT(bus.dev, device_desc.device, true);
     SPI_EXCHANGE(bus.dev, send, recv, len);
-    SPI_SELECT(bus.dev, device_desc.device, false);
+    if (!cs_forced) {
+        SPI_SELECT(bus.dev, device_desc.device, false);
+    }
     SPI_LOCK(bus.dev, false);
     perf_end(perf);
     if (use_irq_save) {
@@ -161,6 +187,11 @@ void SPIDevice::do_transfer(uint8_t *send, uint8_t *recv, uint32_t len)
 bool SPIDevice::transfer(const uint8_t *send, uint32_t send_len,
                          uint8_t *recv, uint32_t recv_len)
 {
+    if (send_len == recv_len && send == recv) {
+        // simplest cases, needed for DMA
+        do_transfer(send, recv, recv_len);
+        return true;
+    }
     uint8_t buf[send_len+recv_len];
     if (send_len > 0) {
         memcpy(buf, send, send_len);
@@ -192,7 +223,7 @@ AP_HAL::Semaphore *SPIDevice::get_semaphore()
 
 AP_HAL::Device::PeriodicHandle SPIDevice::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
 {
-    return bus.register_periodic_callback(period_usec, cb);
+    return bus.register_periodic_callback(period_usec, cb, this);
 }
 
 bool SPIDevice::adjust_periodic_callback(AP_HAL::Device::PeriodicHandle h, uint32_t period_usec)
@@ -200,6 +231,16 @@ bool SPIDevice::adjust_periodic_callback(AP_HAL::Device::PeriodicHandle h, uint3
     return false;
 }
 
+/*
+  allow for control of SPI chip select pin
+ */
+bool SPIDevice::set_chip_select(bool set)
+{
+    cs_forced = set;
+    SPI_SELECT(bus.dev, device_desc.device, set);
+    return true;
+}
+    
 
 /*
   return a SPIDevice given a string device name

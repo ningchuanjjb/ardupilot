@@ -213,8 +213,8 @@ AP_InertialSensor_MPU9250::AP_InertialSensor_MPU9250(AP_InertialSensor &imu,
                                                      enum Rotation rotation)
     : AP_InertialSensor_Backend(imu)
     , _temp_filter(1000, 1)
-    , _rotation(rotation)
     , _dev(std::move(dev))
+    , _rotation(rotation)
 {
 }
 
@@ -421,7 +421,7 @@ bool AP_InertialSensor_MPU9250::_data_ready(uint8_t int_status)
 }
 
 
-bool AP_InertialSensor_MPU9250::_accumulate(uint8_t *samples, uint8_t n_samples, int16_t raw_temp)
+bool AP_InertialSensor_MPU9250::_accumulate(uint8_t *samples, uint8_t n_samples)
 {
     for (uint8_t i = 0; i < n_samples; i++) {
         const uint8_t *data = samples + MPU_SAMPLE_SIZE * i;
@@ -433,12 +433,12 @@ bool AP_InertialSensor_MPU9250::_accumulate(uint8_t *samples, uint8_t n_samples,
         accel *= MPU9250_ACCEL_SCALE_1G;
 
         int16_t t2 = int16_val(data, 3);
-        if (abs(t2 - raw_temp) > 400) {
-            debug("temp reset %d %d %d", raw_temp, t2, raw_temp-t2);
+        if (!_check_raw_temp(t2)) {
+            debug("temp reset %d %d %d", _raw_temp, t2, _raw_temp-t2);
             _fifo_reset();
             return false;
         }
-        float temp = t2/340 + 36.53;
+        float temp = t2/340.0f + 36.53f;
         
         gyro = Vector3f(int16_val(data, 5),
                         int16_val(data, 4),
@@ -464,7 +464,7 @@ bool AP_InertialSensor_MPU9250::_accumulate(uint8_t *samples, uint8_t n_samples,
   gives very good aliasing rejection at frequencies well above what
   can be handled with 1kHz sample rates.
  */
-bool AP_InertialSensor_MPU9250::_accumulate_fast_sampling(uint8_t *samples, uint8_t n_samples, int16_t raw_temp)
+bool AP_InertialSensor_MPU9250::_accumulate_fast_sampling(uint8_t *samples, uint8_t n_samples)
 {
     int32_t tsum = 0;
     const int32_t clip_limit = AP_INERTIAL_SENSOR_ACCEL_CLIP_THRESH_MSS / MPU9250_ACCEL_SCALE_1G;
@@ -476,8 +476,8 @@ bool AP_InertialSensor_MPU9250::_accumulate_fast_sampling(uint8_t *samples, uint
 
         // use temperatue to detect FIFO corruption
         int16_t t2 = int16_val(data, 3);
-        if (abs(t2 - raw_temp) > 400) {
-            debug("temp reset %d %d %d", raw_temp, t2, raw_temp - t2);
+        if (!_check_raw_temp(t2)) {
+            debug("temp reset %d %d %d", _raw_temp, t2, _raw_temp - t2);
             _fifo_reset();
             ret = false;
             break;
@@ -527,11 +527,28 @@ bool AP_InertialSensor_MPU9250::_accumulate_fast_sampling(uint8_t *samples, uint
     }
 
     if (ret) {
-        float temp = (tsum/n_samples)/340.0 + 36.53;
+        float temp = (static_cast<float>(tsum)/n_samples)/340.0f + 36.53f;
         _temp_filtered = _temp_filter.apply(temp);
     }
 
     return ret;
+}
+
+
+/*
+  fetch temperature in order to detect FIFO sync errors
+*/
+bool AP_InertialSensor_MPU9250::_check_raw_temp(int16_t t2)
+{
+    if (abs(t2 - _raw_temp) < 400) {
+        // cached copy OK
+        return true;
+    }
+    uint8_t trx[2];
+    if (_block_read(MPUREG_TEMP_OUT_H, trx, 2)) {
+        _raw_temp = int16_val(trx, 0);
+    }
+    return (abs(t2 - _raw_temp) < 400);
 }
 
 
@@ -543,8 +560,6 @@ bool AP_InertialSensor_MPU9250::_read_sample()
     uint8_t n_samples;
     uint16_t bytes_read;
     uint8_t *rx = _fifo_buffer;
-    int16_t raw_temp;
-    uint8_t trx[2];
     bool need_reset = false;
     
     if (!_block_read(MPUREG_FIFO_COUNTH, rx, 2)) {
@@ -560,14 +575,6 @@ bool AP_InertialSensor_MPU9250::_read_sample()
     }
 
     /*
-      fetch temperature in order to detect FIFO sync errors
-     */
-    if (!_block_read(MPUREG_TEMP_OUT_H, trx, 2)) {
-        return true;
-    }
-    raw_temp = int16_val(trx, 0);
-
-    /*
       testing has shown that if we have more than 32 samples in the
       FIFO then some of those samples will be corrupt. It always is
       the ones at the end of the FIFO, so clear those with a reset
@@ -581,18 +588,32 @@ bool AP_InertialSensor_MPU9250::_read_sample()
     
     while (n_samples > 0) {
         uint8_t n = MIN(MPU_FIFO_BUFFER_LEN, n_samples);
-        if (!_block_read(MPUREG_FIFO_R_W, rx, n * MPU_SAMPLE_SIZE)) {
-            printf("MPU60x0: error in fifo read %u bytes\n", n * MPU_SAMPLE_SIZE);
-            goto check_registers;
+        if (!_dev->set_chip_select(true)) {
+            if (!_block_read(MPUREG_FIFO_R_W, rx, n * MPU_SAMPLE_SIZE)) {
+                goto check_registers;
+            }
+        } else {
+            // this ensures we keep things nicely setup for DMA
+            uint8_t reg = MPUREG_FIFO_R_W | 0x80;
+            if (!_dev->transfer(&reg, 1, nullptr, 0)) {
+                _dev->set_chip_select(false);
+                goto check_registers;
+            }
+            memset(rx, 0, n * MPU_SAMPLE_SIZE);
+            if (!_dev->transfer(rx, n * MPU_SAMPLE_SIZE, rx, n * MPU_SAMPLE_SIZE)) {
+                hal.console->printf("MPU60x0: error in fifo read %u bytes\n", n * MPU_SAMPLE_SIZE);
+                _dev->set_chip_select(false);
+                goto check_registers;
+            }
+            _dev->set_chip_select(false);
         }
-
         if (_fast_sampling) {
-            if (!_accumulate_fast_sampling(rx, n, raw_temp)) {
+            if (!_accumulate_fast_sampling(rx, n)) {
                 debug("stop at %u of %u", n_samples, bytes_read/MPU_SAMPLE_SIZE);
                 break;
             }
         } else {
-            if (!_accumulate(rx, n, raw_temp)) {
+            if (!_accumulate(rx, n)) {
                 break;
             }
         }
@@ -605,15 +626,13 @@ bool AP_InertialSensor_MPU9250::_read_sample()
     }
     
 check_registers:
-    if (_reg_check_counter++ == 10) {
-        _reg_check_counter = 0;
-        // check next register value for correctness
-        if (!_dev->check_next_register()) {
-            _inc_gyro_error_count(_gyro_instance);
-            _inc_accel_error_count(_accel_instance);
-        }
+    // check next register value for correctness
+    _dev->set_speed(AP_HAL::Device::SPEED_LOW);
+    if (!_dev->check_next_register()) {
+        _inc_gyro_error_count(_gyro_instance);
+        _inc_accel_error_count(_accel_instance);
     }
-    
+    _dev->set_speed(AP_HAL::Device::SPEED_HIGH);
     return true;
 }
 
@@ -642,7 +661,7 @@ bool AP_InertialSensor_MPU9250::_hardware_init(void)
     }
 
     // setup for register checking
-    _dev->setup_checked_registers(6);
+    _dev->setup_checked_registers(6, 20);
 
     // initially run the bus at low speed
     _dev->set_speed(AP_HAL::Device::SPEED_LOW);
