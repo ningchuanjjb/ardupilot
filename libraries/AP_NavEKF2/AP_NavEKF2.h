@@ -1,5 +1,8 @@
 /*
-  24 state EKF based on https://github.com/priseborough/InertialNav
+  24 state EKF based on the derivation in https://github.com/priseborough/
+  InertialNav/blob/master/derivations/RotationVectorAttitudeParameterisation/
+  GenerateNavFilterEquations.m
+
   Converted from Matlab to C++ by Paul Riseborough
 
   EKF Tuning parameters refactored by Tom Cauchois
@@ -26,7 +29,6 @@
 #include <AP_Baro/AP_Baro.h>
 #include <AP_Airspeed/AP_Airspeed.h>
 #include <AP_Compass/AP_Compass.h>
-#include <AP_NavEKF/AP_Nav_Common.h>
 #include <AP_RangeFinder/AP_RangeFinder.h>
 
 class NavEKF2_core;
@@ -300,6 +302,9 @@ public:
     // report any reason for why the backend is refusing to initialise
     const char *prearm_failure_reason(void) const;
 
+    // set and save the _baroAltNoise parameter
+    void set_baro_alt_noise(float noise) { _baroAltNoise.set_and_save(noise); };
+
     // allow the enable flag to be set by Replay
     void set_enable(bool enable) { _enable.set(enable); }
 
@@ -356,11 +361,13 @@ private:
     AP_Float _yawNoise;             // magnetic yaw measurement noise : rad
     AP_Int16 _yawInnovGate;         // Percentage number of standard deviations applied to magnetic yaw innovation consistency check
     AP_Int8 _tauVelPosOutput;       // Time constant of output complementary filter : csec (centi-seconds)
-    AP_Int8 _useRngSwHgt;           // Maximum valid range of the range finder in metres
+    AP_Int8 _useRngSwHgt;           // Maximum valid range of the range finder as a percentage of the maximum range specified by the sensor driver
     AP_Float _terrGradMax;          // Maximum terrain gradient below the vehicle
     AP_Float _rngBcnNoise;          // Range beacon measurement noise (m)
     AP_Int16 _rngBcnInnovGate;      // Percentage number of standard deviations applied to range beacon innovation consistency check
     AP_Int8  _rngBcnDelay_ms;       // effective average delay of range beacon measurements rel to IMU (msec)
+    AP_Float _useRngSwSpd;          // Maximum horizontal ground speed to use range finder as the primary height source (m/s)
+    AP_Int8 _magMask;               // Bitmask forcng specific EKF core instances to use simple heading magnetometer fusion.
 
     // Tuning parameters
     const float gpsNEVelVarAccScale;    // Scale factor applied to NE velocity measurement variance due to manoeuvre acceleration
@@ -421,6 +428,8 @@ private:
         uint32_t last_primary_change; // last time a primary has changed
         float core_delta;             // the amount of D position change between cores when a change happened
     } pos_down_reset_data;
+
+    bool runCoreSelection; // true when the primary core has stabilised and the core selection logic can be started
 
     // update the yaw reset data to capture changes due to a lane switch
     // new_primary - index of the ekf instance that we are about to switch to as the primary
